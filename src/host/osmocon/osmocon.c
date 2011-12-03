@@ -221,10 +221,14 @@ int serial_up_to_eleven(void)
 {
 	int rv;
 
+	fprintf(stdout, "Setting non standard baud rates\n");
 	/* Attempt custom baudrate */
-	rv = osmo_serial_set_custom_baudrate(dnload.serial_fd.fd, 406250);
+	rv = osmo_serial_set_custom_baudrate(dnload.serial_fd.fd, 406250);//406250
 	if (rv == 0)
+	{
+		fprintf(stdout, "Non standard baud rate set\n");
 		return 0;
+	}
 
 #ifdef I_HAVE_A_CP210x /* and I know what I'm doing, I swear ! */
 	/* Try closest standard baudrate (CP210x reprogrammed adapters) */
@@ -1017,7 +1021,7 @@ static int handle_read_romload(void)
 			dnload.romload_state = WAITING_IDENTIFICATION;
 			dnload.filename = dnload.previous_filename;
 			dnload.mode = dnload.previous_mode;
-			osmo_serial_set_baudrate(dnload.serial_fd.fd, MODEM_BAUDRATE);
+			//osmo_serial_set_baudrate(dnload.serial_fd.fd, MODEM_BAUDRATE);
 		} else if (!memcmp(buffer, romload_branch_nack,
 			   sizeof(romload_branch_nack))) {
 			printf("Received branch nack, aborting\n");
