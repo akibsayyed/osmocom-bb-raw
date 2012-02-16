@@ -23,6 +23,11 @@
 #include <stdint.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <getopt.h>
+
+#include <arpa/inet.h>
 
 #include <osmocom/core/msgb.h>
 #include <osmocom/gsm/rsl.h>
@@ -31,6 +36,9 @@
 #include <osmocom/gsm/gsm48.h>
 #include <osmocom/core/signal.h>
 #include <osmocom/gsm/protocol/gsm_04_08.h>
+#include <osmocom/core/gsmtap_util.h>
+#include <osmocom/core/bits.h>
+#include <osmocom/gsm/a5.h>
 
 #include <osmocom/bb/common/logging.h>
 #include <osmocom/bb/misc/rslms.h>
@@ -41,12 +49,34 @@
 
 #include <l1ctl_proto.h>
 
+#include <osmocom/bb/misc/xcch.h>
+
+extern struct gsmtap_inst *gsmtap_inst;
+
+enum dch_state_t {
+	DCH_NONE,
+	DCH_WAIT_EST,
+	DCH_ACTIVE,
+	DCH_WAIT_REL,
+};
+
 static struct {
-	int has_si1;
-	int ccch_mode;
-	int ccch_enabled;
-	int rach_count;
-	struct gsm_sysinfo_freq cell_arfcns[1024];
+	int			has_si1;
+	int			ccch_mode;
+
+	enum dch_state_t	dch_state;
+	uint8_t			dch_nr;
+	int			dch_badcnt;
+	int			dch_ciph;
+
+	FILE *			fh;
+
+	sbit_t			bursts_dl[116 * 4];
+	sbit_t			bursts_ul[116 * 4];
+
+	struct gsm_sysinfo_freq	cell_arfcns[1024];
+
+	uint8_t			kc[8];
 } app_state;
 
 
@@ -177,12 +207,15 @@ static int gsm48_rx_imm_ass(struct msgb *msg, struct osmocom_ms *ms)
 {
 	struct gsm48_imm_ass *ia = msgb_l3(msg);
 	uint8_t ch_type, ch_subch, ch_ts;
+	int rv;
 
 	/* Discard packet TBF assignement */
 	if (ia->page_mode & 0xf0)
 		return 0;
 
-	/* FIXME: compare RA and GSM time with when we sent RACH req */
+	/* If we're not ready yet, or just busy ... */
+	if ((!app_state.has_si1) || (app_state.dch_state != DCH_NONE))
+		return 0;
 
 	rsl_dec_chan_nr(ia->chan_desc.chan_nr, &ch_type, &ch_subch, &ch_ts);
 
@@ -197,6 +230,10 @@ static int gsm48_rx_imm_ass(struct msgb *msg, struct osmocom_ms *ms)
 			ia->chan_desc.chan_nr, arfcn, ch_ts, ch_subch,
 			ia->chan_desc.h0.tsc);
 
+		/* request L1 to go to dedicated mode on assigned channel */
+		rv = l1ctl_tx_dm_est_req_h0(ms,
+			arfcn, ia->chan_desc.chan_nr, ia->chan_desc.h0.tsc,
+			GSM48_CMODE_SIGN, 0);
 	} else {
 		/* Hopping */
 		uint8_t maio, hsn, ma_len;
@@ -223,10 +260,22 @@ static int gsm48_rx_imm_ass(struct msgb *msg, struct osmocom_ms *ms)
 				j++;
 			}
 		}
+
+		/* request L1 to go to dedicated mode on assigned channel */
+		rv = l1ctl_tx_dm_est_req_h1(ms,
+			maio, hsn, ma, ma_len,
+			ia->chan_desc.chan_nr, ia->chan_desc.h1.tsc,
+			GSM48_CMODE_SIGN, 0);
 	}
 
 	LOGPC(DRR, LOGL_NOTICE, "\n");
-	return 0;
+
+	/* Set state */
+	app_state.dch_state = DCH_WAIT_EST;
+	app_state.dch_nr = ia->chan_desc.chan_nr;
+	app_state.dch_badcnt = 0;
+
+	return rv;
 }
 
 static const char *pag_print_mode(int mode)
@@ -411,6 +460,10 @@ int gsm48_rx_ccch(struct msgb *msg, struct osmocom_ms *ms)
 	struct gsm48_system_information_type_header *sih = msgb_l3(msg);
 	int rc = 0;
 
+	/* CCCH marks the end of WAIT_REL */
+	if (app_state.dch_state == DCH_WAIT_REL)
+		app_state.dch_state = DCH_NONE;
+
 	if (sih->rr_protocol_discriminator != GSM48_PDISC_RR)
 		LOGP(DRR, LOGL_ERROR, "PCH pdisc != RR\n");
 
@@ -444,19 +497,253 @@ int gsm48_rx_ccch(struct msgb *msg, struct osmocom_ms *ms)
 
 int gsm48_rx_bcch(struct msgb *msg, struct osmocom_ms *ms)
 {
+	/* BCCH marks the end of WAIT_REL */
+	if (app_state.dch_state == DCH_WAIT_REL)
+		app_state.dch_state = DCH_NONE;
+
 	/* FIXME: we have lost the gsm frame time until here, need to store it
 	 * in some msgb context */
 	//dump_bcch(dl->time.tc, ccch->data);
 	dump_bcch(ms, 0, msg->l3h);
 
-	/* Req channel logic */
-	if (app_state.ccch_enabled && (app_state.rach_count < 2)) {
-		l1ctl_tx_rach_req(ms, app_state.rach_count, 0,
-			app_state.ccch_mode == CCCH_MODE_COMBINED);
-		app_state.rach_count++;
+	return 0;
+}
+
+
+static void
+local_burst_decode(struct l1ctl_burst_ind *bi)
+{
+	int16_t rx_dbm;
+	uint16_t arfcn;
+	uint32_t fn;
+	uint8_t cbits, tn, lch_idx;
+	int ul, bid, i;
+	sbit_t *bursts;
+	ubit_t bt[116];
+
+	/* Get params (Only for SDCCH and SACCH/{4,8,F,H}) */
+	arfcn  = ntohs(bi->band_arfcn);
+	rx_dbm = rxlev2dbm(bi->rx_level);
+
+	fn     = ntohl(bi->frame_nr);
+	ul     = !!(arfcn & ARFCN_UPLINK);
+	bursts = ul ? app_state.bursts_ul : app_state.bursts_dl;
+
+	cbits  = bi->chan_nr >> 3;
+	tn     = bi->chan_nr & 7;
+
+	bid    = -1;
+
+	if (cbits == 0x01) {			/* TCH/F */
+		lch_idx = 0;
+		if (bi->flags & BI_FLG_SACCH) {
+			uint32_t fn_report;
+			fn_report = (fn - (tn * 13) + 104) % 104;
+			bid = (fn_report - 12) / 26;
+		}
+	} else if ((cbits & 0x1e) == 0x02) {	/* TCH/H */
+		lch_idx = cbits & 1;
+		if (bi->flags & BI_FLG_SACCH) {
+			uint32_t fn_report;
+			uint8_t tn_report = (tn & ~1) | lch_idx;
+			fn_report = (fn - (tn_report * 13) + 104) % 104;
+			bid = (fn_report - 12) / 26;
+		}
+	} else if ((cbits & 0x1c) == 0x04) {	/* SDCCH/4 */
+		lch_idx = cbits & 3;
+		bid = bi->flags & 3;
+	} else if ((cbits & 0x18) == 0x08) {	/* SDCCH/8 */
+		lch_idx = cbits & 7;
+		bid = bi->flags & 3;
 	}
 
-	return 0;
+	if (bid == -1)
+		return;
+
+	/* Clear if new set */
+	if (bid == 0)
+		memset(bursts, 0x00, 116 * 4);
+
+	/* Unpack (ignore hu/hl) */
+	osmo_pbit2ubit_ext(bt,  0, bi->bits,  0, 57, 0);
+	osmo_pbit2ubit_ext(bt, 59, bi->bits, 57, 57, 0);
+	bt[57] = bt[58] = 1;
+
+	/* A5/x */
+	if (app_state.dch_ciph) {
+		ubit_t ks_dl[114], ks_ul[114], *ks = ul ? ks_ul : ks_dl;
+		osmo_a5(app_state.dch_ciph, app_state.kc, fn, ks_dl, ks_ul);
+		for (i= 0; i< 57; i++)  bt[i] ^= ks[i];
+		for (i=59; i<116; i++)  bt[i] ^= ks[i-2];
+	}
+
+	fprintf( app_state.fh, "P %d ", ntohl(bi->frame_nr));
+
+
+	for (i=0; i<57; i++)
+		fprintf( app_state.fh, "%d", bt[i] );
+	for (i=59; i<116; i++)
+		fprintf( app_state.fh, "%d", bt[i] );
+
+     fprintf( app_state.fh, "\n" );
+
+	/* Convert to softbits */
+	for (i=0; i<116; i++)
+		bursts[(116*bid)+i] = bt[i] ? - (bi->snr >> 1) : (bi->snr >> 1);
+
+	/* If last, decode */
+	if (bid == 3)
+	{
+		uint8_t l2[23];
+		int rv;
+		rv = xcch_decode(l2, bursts);
+
+		if (rv == 0)
+		{
+			uint8_t chan_type, chan_ts, chan_ss;
+			uint8_t gsmtap_chan_type;
+
+            fprintf( app_state.fh,"F ");
+            for  (i=0; i<23; i++)
+                fprintf( app_state.fh, "%x ", l2[i]);
+            fprintf( app_state.fh, "\n");
+
+			/* Send to GSMTAP */
+			rsl_dec_chan_nr(bi->chan_nr, &chan_type, &chan_ss, &chan_ts);
+			gsmtap_chan_type = chantype_rsl2gsmtap(
+				chan_type,
+				bi->flags & BI_FLG_SACCH ? 0x40 : 0x00
+			);
+			LOGP(DRR, LOGL_NOTICE, "Burst data\n");
+			gsmtap_send(gsmtap_inst,
+				arfcn, chan_ts, gsmtap_chan_type, chan_ss,
+				ntohl(bi->frame_nr), bi->rx_level, bi->snr,
+				l2, sizeof(l2)
+			);
+
+			/* Crude CIPH.MOD.COMMAND detect */
+			if ((l2[3] == 0x06) && (l2[4] == 0x35) && (l2[5] & 1))
+				app_state.dch_ciph = 1 + ((l2[5] >> 1) & 7);
+		}
+		else
+			LOGP(DRR, LOGL_NOTICE, "Error decoding data, data encripted?\n");
+	}
+}
+
+static char *
+gen_filename(struct osmocom_ms *ms, struct l1ctl_burst_ind *bi)
+{
+	static char buffer[256];
+	time_t d;
+	struct tm lt;
+
+	time(&d);
+	localtime_r(&d, &lt);
+
+	snprintf(buffer, 256, "bursts_%04d%02d%02d_%02d%02d_%d_%d_%02x.dat",
+		lt.tm_year + 1900, lt.tm_mon, lt.tm_mday,
+		lt.tm_hour, lt.tm_min,
+		ms->test_arfcn,
+		ntohl(bi->frame_nr),
+		bi->chan_nr
+	);
+
+	return buffer;
+}
+
+void layer3_rx_burst(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct l1ctl_burst_ind *bi;
+	int16_t rx_dbm;
+	uint16_t arfcn;
+	int ul, do_rel=0, i;
+	ubit_t bt[116];
+
+	/* Header handling */
+	bi = (struct l1ctl_burst_ind *) msg->l1h;
+
+	arfcn = ntohs(bi->band_arfcn);
+	rx_dbm = rxlev2dbm(bi->rx_level);
+	ul = !!(arfcn & ARFCN_UPLINK);
+
+	/* Check for channel start */
+	if (app_state.dch_state == DCH_WAIT_EST) {
+		if (bi->chan_nr == app_state.dch_nr) {
+			if (bi->snr > 64) {
+				/* Change state */
+				app_state.dch_state = DCH_ACTIVE;
+				app_state.dch_badcnt = 0;
+
+				/* Open output */
+				app_state.fh = fopen(gen_filename(ms, bi), "wb");
+			} else {
+				/* Abandon ? */
+				do_rel = (app_state.dch_badcnt++) >= 4;
+			}
+		}
+	}
+
+	/* Check for channel end */
+	if (app_state.dch_state == DCH_ACTIVE) {
+		if (!ul) {
+			/* Bad burst counting */
+			if (bi->snr < 64)
+				app_state.dch_badcnt++;
+			else if (app_state.dch_badcnt >= 2)
+				app_state.dch_badcnt -= 2;
+			else
+				app_state.dch_badcnt = 0;
+
+			/* Release condition */
+			do_rel = app_state.dch_badcnt >= 6;
+		}
+	}
+
+	/* Release ? */
+	if (do_rel) {
+		/* L1 release */
+		l1ctl_tx_dm_rel_req(ms);
+		l1ctl_tx_fbsb_req(ms, ms->test_arfcn,
+				L1CTL_FBSB_F_FB01SB, 100, 0,
+				app_state.ccch_mode);
+
+		/* Change state */
+		app_state.dch_state = DCH_WAIT_REL;
+		app_state.dch_badcnt = 0;
+		app_state.dch_ciph = 0;
+
+		/* Close output */
+		if (app_state.fh) {
+			fclose(app_state.fh);
+			app_state.fh = NULL;
+		}
+	}
+
+	/* Save the burst */
+	//if (app_state.dch_state == DCH_ACTIVE)
+	//	fwrite(bi, sizeof(*bi), 1, app_state.fh);
+
+	/* Save the burst to airprobe format */
+	if (app_state.dch_state == DCH_ACTIVE)
+	{
+	    fprintf( app_state.fh, "C %d ", ntohl(bi->frame_nr));
+
+	    /* Unpack (ignore hu/hl) */
+	    osmo_pbit2ubit_ext(bt,  0, bi->bits,  0, 57, 0);
+	    osmo_pbit2ubit_ext(bt, 59, bi->bits, 57, 57, 0);
+	    bt[57] = bt[58] = 1;
+
+	    for (i=0; i<57; i++)
+		fprintf( app_state.fh, "%d", bt[i] );
+	    for (i=59; i<116; i++)
+		fprintf( app_state.fh, "%d", bt[i] );
+
+	    fprintf( app_state.fh, "\n" );
+	}
+
+	/* Try local decoding */
+	if (app_state.dch_state == DCH_ACTIVE)
+		local_burst_decode(bi);
 }
 
 void layer3_app_reset(void)
@@ -464,8 +751,13 @@ void layer3_app_reset(void)
 	/* Reset state */
 	app_state.has_si1 = 0;
 	app_state.ccch_mode = CCCH_MODE_NONE;
-	app_state.ccch_enabled = 0;
-	app_state.rach_count = 0;
+	app_state.dch_state = DCH_NONE;
+	app_state.dch_badcnt = 0;
+	app_state.dch_ciph = 0;
+
+	if (app_state.fh)
+		fclose(app_state.fh);
+	app_state.fh = NULL;
 
 	memset(&app_state.cell_arfcns, 0x00, sizeof(app_state.cell_arfcns));
 }
@@ -474,11 +766,17 @@ static int signal_cb(unsigned int subsys, unsigned int signal,
 		     void *handler_data, void *signal_data)
 {
 	struct osmocom_ms *ms;
+	struct osmobb_msg_ind *mi;
 
 	if (subsys != SS_L1CTL)
 		return 0;
 
 	switch (signal) {
+	case S_L1CTL_BURST_IND:
+		mi = signal_data;
+		layer3_rx_burst(mi->ms, mi->msg);
+		break;
+
 	case S_L1CTL_RESET:
 		ms = signal_data;
 		layer3_app_reset();
@@ -498,9 +796,52 @@ int l23_app_init(struct osmocom_ms *ms)
 	return layer3_init(ms);
 }
 
+static int l23_cfg_supported()
+{
+	return L23_OPT_TAP | L23_OPT_DBG | L23_OPT_ARFCN;
+}
+
+static int l23_getopt_options(struct option **options)
+{
+	static struct option opts [] = {
+		{"kc", 1, 0, 'k'},
+	};
+
+	*options = opts;
+	return ARRAY_SIZE(opts);
+}
+
+static int l23_cfg_print_help()
+{
+	printf("\nApplication specific\n");
+	printf("  -k --kc KEY           Key to use to try to decipher DCCHs\n");
+
+	return 0;
+}
+
+static int l23_cfg_handle(int c, const char *optarg)
+{
+	switch (c) {
+	case 'k':
+		if (osmo_hexparse(optarg, app_state.kc, 8) != 8) {
+			fprintf(stderr, "Invalid Kc\n");
+			exit(-1);
+		}
+		break;
+	default:
+		return -1;
+	}
+	return 0;
+}
+
 static struct l23_app_info info = {
 	.copyright	= "Copyright (C) 2010 Harald Welte <laforge@gnumonks.org>\n",
 	.contribution	= "Contributions by Holger Hans Peter Freyther\n",
+	.getopt_string	= "k:",
+	.cfg_supported	= l23_cfg_supported,
+	.cfg_getopt_opt = l23_getopt_options,
+	.cfg_handle_opt	= l23_cfg_handle,
+	.cfg_print_help	= l23_cfg_print_help,
 };
 
 struct l23_app_info *l23_app_info()
