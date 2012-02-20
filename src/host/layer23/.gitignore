@@ -20,6 +20,7 @@ config.status
 # build by-products
 *.o
 *.a
+*.pyc
 
 # various
 *.sw?
@@ -34,6 +35,7 @@ src/misc/cbch_sniff
 src/misc/ccch_scan
 src/misc/layer23
 src/misc/burst_decode
+src/misc/burst_encode
 src/misc/*.dat
 src/misc/cell_log_*
 src/misc/KC
